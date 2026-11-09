@@ -280,6 +280,7 @@ const makeHarness = Effect.fnUntraced(function* (threads: Layer.Layer<never> = L
   });
   Object.assign(tokens, {
     "thread-token": caller("rtx", thread),
+    "other-thread-token": caller("rtx", ThreadId.make("thread-2")),
     "background-token": caller("rtx"),
     "hang-token": caller("hang", thread),
     "loop-token": caller("loop", thread),
@@ -325,7 +326,13 @@ it.live("streams chat completions with only the server's key and records usage",
       post(
         "thread-token",
         { model: "GLM-5.3-Flash", stream: true, messages: [] },
-        { cookie: "t3=session", "x-api-key": "thread-token" },
+        {
+          cookie: "t3=session",
+          "x-api-key": "thread-token",
+          "x-proxy-client": "spoofed",
+          "x-proxy-session-id": "spoofed-session",
+          "x-proxy-turn-id": "spoofed-turn",
+        },
       ),
     );
     expect(response.status).toBe(200);
@@ -337,6 +344,9 @@ it.live("streams chat completions with only the server's key and records usage",
     expect(upstream.headers.authorization).toBe("Bearer upstream-secret");
     expect(upstream.headers["x-api-key"]).toBe("upstream-secret");
     expect(upstream.headers.cookie).toBeUndefined();
+    expect(upstream.headers["x-proxy-client"]).toBe("t3code");
+    expect(upstream.headers["x-proxy-session-id"]).toBeUndefined();
+    expect(upstream.headers["x-proxy-turn-id"]).toBeUndefined();
     expect(upstream.body).toEqual({
       model: "GLM-5.3-Flash",
       stream: true,
@@ -564,7 +574,7 @@ it.live("attributes a request to its active run, its delegating run and its sche
 
 it.live("attributes a shared harness's request to its session's thread, within its instance", () =>
   Effect.gen(function* () {
-    const runId = RunId.make("run-1");
+    let runId = RunId.make("run-1");
     const { call, seen, records } = yield* makeHarness(
       Layer.mock(ThreadManagementService.ThreadManagementService)({
         getThreadShell: () => Effect.succeed({ activeRunId: runId, lineage: {} } as never),
@@ -574,21 +584,52 @@ it.live("attributes a shared harness's request to its session's thread, within i
     const send = (token: string, sessionId: string) =>
       call(
         "rtx/v1/chat/completions",
-        post(token, { model: "m", stream: true }, { "x-opencode-session-id": sessionId }),
+        post(
+          token,
+          { model: "m", stream: true },
+          {
+            "x-opencode-session-id": sessionId,
+            "x-proxy-session-id": "spoofed-session",
+            "x-proxy-turn-id": "spoofed-turn",
+          },
+        ),
       ).pipe(Effect.flatMap((response) => Effect.promise(() => response.text())));
 
     yield* send("opencode-token", "ses_a");
-    expect((yield* Queue.take(seen)).headers["x-opencode-session-id"]).toBeUndefined();
+    const first = (yield* Queue.take(seen)).headers;
+    expect(first["x-opencode-session-id"]).toBeUndefined();
+    expect(first["x-proxy-client"]).toBe("t3code");
+    expect(first["x-proxy-session-id"]).toMatch(/^[a-f0-9]{64}$/);
+    expect(first["x-proxy-turn-id"]).toMatch(/^[a-f0-9]{64}$/);
     expect(yield* Queue.take(records)).toMatchObject({
       threadId: thread,
       runId,
       purpose: "interactive",
     });
+    yield* send("opencode-token", "ses_a");
+    const toolStep = (yield* Queue.take(seen)).headers;
+    expect(toolStep["x-proxy-session-id"]).toBe(first["x-proxy-session-id"]);
+    expect(toolStep["x-proxy-turn-id"]).toBe(first["x-proxy-turn-id"]);
+    yield* Queue.take(records);
+    runId = RunId.make("run-2");
+    yield* send("opencode-token", "ses_a");
+    const nextTurn = (yield* Queue.take(seen)).headers;
+    expect(nextTurn["x-proxy-session-id"]).toBe(first["x-proxy-session-id"]);
+    expect(nextTurn["x-proxy-turn-id"]).not.toBe(first["x-proxy-turn-id"]);
+    yield* Queue.take(records);
+    yield* send("other-thread-token", "ses_a");
+    const otherThread = (yield* Queue.take(seen)).headers;
+    expect(otherThread["x-proxy-session-id"]).not.toBe(first["x-proxy-session-id"]);
+    expect(otherThread["x-proxy-turn-id"]).not.toBe(nextTurn["x-proxy-turn-id"]);
+    yield* Queue.take(records);
     for (const [token, sessionId] of [
       ["other-instance-token", "ses_a"],
       ["opencode-token", "ses_unknown"],
     ] as const) {
       yield* send(token, sessionId);
+      const unattributed = (yield* Queue.take(seen)).headers;
+      expect(unattributed["x-proxy-session-id"]).toBeUndefined();
+      expect(unattributed["x-proxy-turn-id"]).toBeUndefined();
       expect(yield* Queue.take(records)).toMatchObject({
         threadId: null,
         runId: null,

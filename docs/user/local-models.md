@@ -9,6 +9,12 @@ The inference server must be reachable from the environment's machine. `localhos
 means the machine running the T3 Code server, even when you are connected from a
 phone or another computer.
 
+For routing proxies that use `x-proxy-session-id` and `x-proxy-turn-id`, the managed
+gateway supplies private identifiers from the authenticated thread and active run.
+Tool calls in one run share a turn; a new run gets a new turn. Background requests
+and requests without an identified active run remain untracked. These headers do
+not authenticate requests or prevent the proxy from routing to a cloud model.
+
 ## Use a local model
 
 The quickest start is **Use a local model**: on first run under **Agents**, in **Settings →

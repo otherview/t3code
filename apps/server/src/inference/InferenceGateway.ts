@@ -253,6 +253,8 @@ const make = Effect.gen(function* () {
   const requestLog = yield* InferenceRequests.InferenceRequestLog;
   const random = yield* SecureRandom.SecureRandom;
   const digest = yield* Digest.Digest;
+  // Keep upstream affinity private and separate from another environment's thread/run IDs.
+  const affinityNamespace = yield* random.uuidV4();
   const routing = yield* InferenceRouting.InferenceRouting;
   const stops = yield* InferenceStops.InferenceStops;
   const threads = yield* Effect.serviceOption(ThreadManagementService.ThreadManagementService);
@@ -430,6 +432,20 @@ const make = Effect.gen(function* () {
           )).slice(0, 16);
     const { purpose, runId, parentRunId } = yield* attribute(caller);
     const requestId = yield* random.uuidV4();
+    const proxyHeaders: Record<string, string> = { "x-proxy-client": "t3code" };
+    // Generate these from authenticated thread state, never from caller-supplied proxy headers.
+    // Without a known active run, leave the request untracked rather than pin unrelated work.
+    if (caller.threadId !== undefined && runId !== null) {
+      const threadAffinity = `${affinityNamespace}:${caller.threadId.length}:${caller.threadId}`;
+      proxyHeaders["x-proxy-session-id"] = yield* digest.digestHex(
+        Digest.sha256,
+        new TextEncoder().encode(threadAffinity),
+      );
+      proxyHeaders["x-proxy-turn-id"] = yield* digest.digestHex(
+        Digest.sha256,
+        new TextEncoder().encode(`${threadAffinity}:${runId}`),
+      );
+    }
     // Only streamed replies can run away; a turned-off watchdog leaves the server to its limits.
     const watching = prepared.streaming && config.watchdog?.enabled !== false;
     const watchdog = makeInferenceWatchdog();
@@ -564,7 +580,10 @@ const make = Effect.gen(function* () {
 
       const execute = HttpClient.withScope(client).execute(
         HttpClientRequest.post(`${target.base}/${route}`).pipe(
-          HttpClientRequest.setHeaders(upstreamHeaders(request, target.apiKey)),
+          HttpClientRequest.setHeaders({
+            ...upstreamHeaders(request, target.apiKey),
+            ...proxyHeaders,
+          }),
           HttpClientRequest.bodyUint8Array(prepared.body, "application/json"),
         ),
       );
